@@ -1,0 +1,16 @@
+[project]
+name = "realtime"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp>=3.12.13",
+    "azure-identity>=1.23.0",
+    "python-dotenv>=1.1.0",
+    "pyaudio>=0.2.14", # Added for microphone input
+    "pynput>=1.7.6", # Added for keyboard listening
+    "pygame>=2.6.0", # Added for audio playback
+    "pydub>=0.25.1", # Added for audio resampling
+    "numpy>=2.3.0",
+]
