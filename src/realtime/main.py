@@ -40,81 +40,6 @@ class VoiceChatClientError(Exception):
     """Custom exception for client errors."""
     pass
 
-class ConfigLoader:
-    """Load and validate YAML configuration files for different VAD scenarios."""
-    
-    @staticmethod
-    def load_config(config_path: str) -> dict:
-        """Load configuration from YAML file.
-        
-        Args:
-            config_path: Path to the YAML configuration file
-            
-        Returns:
-            dict: Loaded configuration
-            
-        Raises:
-            VoiceChatClientError: If configuration is invalid or file not found
-        """
-        try:
-            config_file = Path(config_path)
-            if not config_file.exists():
-                raise VoiceChatClientError(f"Configuration file not found: {config_path}")
-            
-            with open(config_file, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f)
-            
-            # Validate required fields
-            required_fields = ['scenario', 'openai', 'turn_detection', 'audio']
-            for field in required_fields:
-                if field not in config:
-                    raise VoiceChatClientError(f"Missing required field '{field}' in configuration")
-            
-            # Validate scenario
-            valid_scenarios = ['realtime-push-to-talk', 'realtime-server-vad', 'realtime-semantic-vad']
-            if config['scenario'] not in valid_scenarios:
-                raise VoiceChatClientError(f"Invalid scenario '{config['scenario']}'. Must be one of: {valid_scenarios}")
-            
-            # Validate turn_detection type
-            if config['turn_detection']['type'] not in [None, 'server_vad', 'semantic_vad']:
-                raise VoiceChatClientError(f"Invalid turn_detection type: {config['turn_detection']['type']}")
-            
-            logger.info(f"Loaded configuration: {config['scenario']} - {config.get('description', 'No description')}")
-            return config
-            
-        except yaml.YAMLError as e:
-            raise VoiceChatClientError(f"Invalid YAML syntax in {config_path}: {e}")
-        except Exception as e:
-            raise VoiceChatClientError(f"Error loading configuration from {config_path}: {e}")
-    
-    @staticmethod
-    def get_default_config() -> dict:
-        """Get default push-to-talk configuration."""
-        return {
-            'scenario': 'realtime-push-to-talk',
-            'description': 'Default push-to-talk configuration',
-            'openai': {
-                'model': 'gpt-4o-realtime-preview',
-                'voice': 'alloy',
-                'temperature': 0.8,
-                'instructions': 'You are a helpful AI assistant. Respond naturally and conversationally.'
-            },
-            'turn_detection': {
-                'type': None
-            },
-            'audio': {
-                'sample_rate': 24000,
-                'channels': 1,
-                'chunk_size': 1024,
-                'format': 'pcm16'
-            },
-            'ui': {
-                'show_audio_messages': False,
-                'show_system_messages': True,
-                'show_debug_messages': False
-            }
-        }
-
 
 class AzureOpenAIRealtimeClient:
     def __init__(self, config: dict, yaml_config: dict = None):
@@ -122,10 +47,10 @@ class AzureOpenAIRealtimeClient:
         
         Args:
             config: Environment configuration (Azure endpoints, etc.)
-            yaml_config: YAML configuration for VAD modes and parameters
+            yaml_config: YAML configuration for VAD modes and parameters (optional)
         """
         self.config = config
-        self.yaml_config = yaml_config or ConfigLoader.get_default_config()
+        self.yaml_config = yaml_config or {}
         self._websocket_url = self._construct_websocket_url()
 
         self._credential = DefaultAzureCredential()
@@ -147,7 +72,7 @@ class AzureOpenAIRealtimeClient:
         self._tasks = []
 
         # VAD mode configuration
-        self._vad_mode = self.yaml_config['turn_detection']['type']
+        self._vad_mode = self.yaml_config.get('turn_detection', {}).get('type')
         self._is_push_to_talk = self._vad_mode is None
 
         # Initialize pygame mixer for audio playback - match Azure OpenAI's 24kHz output
@@ -176,12 +101,13 @@ class AzureOpenAIRealtimeClient:
         self._current_response_text = ""
 
         # Display configuration info
-        self._display_message("status_info", f"Mode: {self.yaml_config['scenario']}")
+        if self.yaml_config.get('scenario'):
+            self._display_message("status_info", f"Mode: {self.yaml_config['scenario']}")
         if self.yaml_config.get('description'):
             self._display_message("status_info", f"Description: {self.yaml_config['description']}")
         self._display_message("status_info", f"VAD Mode: {self._vad_mode or 'Push-to-Talk'}")
-        self._display_message("status_info", f"Voice: {self.yaml_config['openai']['voice']}")
-        self._display_message("status_info", f"Temperature: {self.yaml_config['openai']['temperature']}")
+        self._display_message("status_info", f"Voice: alloy")
+        self._display_message("status_info", f"Temperature: 0.8")
 
     def _construct_websocket_url(self) -> str:
         endpoint = self.config.get("AZURE_OPENAI_ENDPOINT")
@@ -621,25 +547,25 @@ class AzureOpenAIRealtimeClient:
         """
         session_config = {
             "modalities": ["text", "audio"],
-            "instructions": self.yaml_config['openai']['instructions'],
-            "voice": self.yaml_config['openai']['voice'],
+            "instructions": "You are a helpful AI assistant. Respond naturally and conversationally.",
+            "voice": "alloy",
             "input_audio_format": "pcm16",
             "output_audio_format": "pcm16",
             "input_audio_transcription": {
                 "model": "whisper-1"
             },
-            "temperature": self.yaml_config['openai']['temperature']
+            "temperature": 0.8
         }
         
         # Configure turn detection based on YAML config
-        turn_detection_config = self.yaml_config['turn_detection']
+        turn_detection_config = self.yaml_config.get('turn_detection', {})
         
-        if turn_detection_config['type'] is None:
+        if turn_detection_config.get('type') is None:
             # Push-to-talk mode - no automatic turn detection
             session_config["turn_detection"] = None
             logger.debug("Configured for push-to-talk mode (no automatic turn detection)")
             
-        elif turn_detection_config['type'] == 'server_vad':
+        elif turn_detection_config.get('type') == 'server_vad':
             # Server VAD configuration
             vad_config = {
                 "type": "server_vad"
@@ -660,7 +586,7 @@ class AzureOpenAIRealtimeClient:
             session_config["turn_detection"] = vad_config
             logger.debug(f"Configured for server VAD mode: {vad_config}")
             
-        elif turn_detection_config['type'] == 'semantic_vad':
+        elif turn_detection_config.get('type') == 'semantic_vad':
             # Semantic VAD configuration
             vad_config = {
                 "type": "semantic_vad"
@@ -838,13 +764,23 @@ Available configurations:
     yaml_config = None
     if args.config_file:
         try:
-            yaml_config = ConfigLoader.load_config(args.config_file)
-        except VoiceChatClientError as e:
-            print(f"❌ Configuration Error: {e}")
+            config_file = Path(args.config_file)
+            if not config_file.exists():
+                print(f"❌ Configuration file not found: {args.config_file}")
+                return
+            
+            with open(config_file, 'r', encoding='utf-8') as f:
+                yaml_config = yaml.safe_load(f)
+            
+            logger.info(f"Loaded configuration: {yaml_config.get('scenario', 'Unknown')} - {yaml_config.get('description', 'No description')}")
+        except yaml.YAMLError as e:
+            print(f"❌ Invalid YAML syntax in {args.config_file}: {e}")
+            return
+        except Exception as e:
+            print(f"❌ Error loading configuration from {args.config_file}: {e}")
             return
     else:
-        yaml_config = ConfigLoader.get_default_config()
-        print("ℹ️  Using default push-to-talk configuration. Use -f to specify a config file.")
+        print("ℹ️  Using default push-to-talk mode. Use -f to specify a config file for VAD modes.")
     
     # Load Azure environment configuration
     app_config = {
@@ -875,6 +811,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\\n👋 Application interrupted by user (Ctrl+C).")
+        print("👋 Application interrupted by user (Ctrl+C).")
     finally:
         print("➡️  INFO: Main program exit.")

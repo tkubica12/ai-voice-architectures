@@ -5,13 +5,6 @@
 scenario: "realtime-server-vad"
 description: "High sensitivity server VAD for quiet environments"
 
-# OpenAI Configuration
-openai:
-  model: "gpt-4o-realtime-preview"
-  voice: "sage"
-  temperature: 0.7
-  instructions: "You are a helpful AI assistant. Be concise and respond quickly."
-
 # Turn Detection Configuration
 turn_detection:
   type: "server_vad"
@@ -20,16 +13,3 @@ turn_detection:
   silence_duration_ms: 300  # Shorter silence detection for quicker turns
   create_response: true
   interrupt_response: true
-
-# Audio Configuration
-audio:
-  sample_rate: 24000
-  channels: 1
-  chunk_size: 1024
-  format: "pcm16"
-
-# UI Configuration
-ui:
-  show_audio_messages: false
-  show_system_messages: true
-  show_debug_messages: false
