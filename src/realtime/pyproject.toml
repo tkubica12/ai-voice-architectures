@@ -13,4 +13,5 @@ dependencies = [
     "pygame>=2.6.0", # Added for audio playback
     "pydub>=0.25.1", # Added for audio resampling
     "numpy>=2.3.0",
+    "pyyaml>=6.0.0", # Added for YAML configuration support
 ]

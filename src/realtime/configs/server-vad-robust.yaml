@@ -1,0 +1,35 @@
+# Robust Server VAD Configuration
+# This mode uses server-side VAD with low sensitivity settings
+# Good for noisy environments or when you want to avoid false triggers
+
+scenario: "realtime-server-vad"
+description: "Low sensitivity server VAD for noisy environments"
+
+# OpenAI Configuration
+openai:
+  model: "gpt-4o-realtime-preview"
+  voice: "echo"
+  temperature: 0.8
+  instructions: "You are a helpful AI assistant. Wait for complete thoughts before responding."
+
+# Turn Detection Configuration
+turn_detection:
+  type: "server_vad"
+  threshold: 0.7  # Higher threshold = less sensitive, good for noisy environments
+  prefix_padding_ms: 500  # More padding to capture full context
+  silence_duration_ms: 800  # Longer silence duration to avoid premature cutoff
+  create_response: true
+  interrupt_response: false  # Don't interrupt to allow complete thoughts
+
+# Audio Configuration
+audio:
+  sample_rate: 24000
+  channels: 1
+  chunk_size: 1024
+  format: "pcm16"
+
+# UI Configuration
+ui:
+  show_audio_messages: false
+  show_system_messages: true
+  show_debug_messages: false

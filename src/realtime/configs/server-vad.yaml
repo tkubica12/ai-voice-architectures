@@ -1,0 +1,35 @@
+# Server VAD Configuration
+# This mode uses server-side voice activity detection
+# The server automatically detects speech based on silence periods
+
+scenario: "realtime-server-vad"
+description: "Server-side voice activity detection with automatic turn detection"
+
+# OpenAI Configuration
+openai:
+  model: "gpt-4o-realtime-preview"
+  voice: "alloy"  # Options: alloy, ash, ballad, coral, echo, sage, shimmer, verse
+  temperature: 0.8
+  instructions: "You are a helpful AI assistant. Respond naturally and conversationally."
+
+# Turn Detection Configuration
+turn_detection:
+  type: "server_vad"
+  threshold: 0.5  # Range: 0.0-1.0. Higher = less sensitive, better for noisy environments
+  prefix_padding_ms: 300  # Audio to include before detected speech (ms)
+  silence_duration_ms: 500  # Duration of silence to detect speech stop (ms)
+  create_response: true  # Automatically create response when speech stops
+  interrupt_response: true  # Allow interrupting ongoing AI response
+
+# Audio Configuration
+audio:
+  sample_rate: 24000
+  channels: 1
+  chunk_size: 1024
+  format: "pcm16"
+
+# UI Configuration
+ui:
+  show_audio_messages: false
+  show_system_messages: true
+  show_debug_messages: false

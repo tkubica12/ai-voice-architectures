@@ -1,0 +1,30 @@
+# Push-to-Talk Configuration
+# This mode uses manual control (spacebar) for voice input
+# No automatic voice activity detection is used
+
+scenario: "realtime-push-to-talk"
+description: "Manual push-to-talk mode using spacebar to control recording"
+
+# OpenAI Configuration
+openai:
+  model: "gpt-4o-realtime-preview"
+  voice: "alloy"  # Options: alloy, ash, ballad, coral, echo, sage, shimmer, verse
+  temperature: 0.8
+  instructions: "You are a helpful AI assistant. Respond naturally and conversationally."
+
+# Turn Detection Configuration  
+turn_detection:
+  type: null  # Disable automatic turn detection for push-to-talk
+  
+# Audio Configuration
+audio:
+  sample_rate: 24000
+  channels: 1
+  chunk_size: 1024
+  format: "pcm16"
+
+# UI Configuration
+ui:
+  show_audio_messages: false
+  show_system_messages: true
+  show_debug_messages: false

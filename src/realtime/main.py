@@ -2,6 +2,9 @@ import os
 import asyncio
 import aiohttp
 import base64
+import argparse
+import yaml
+from pathlib import Path
 from dotenv import load_dotenv
 from azure.identity.aio import DefaultAzureCredential, get_bearer_token_provider
 import pyaudio
@@ -9,14 +12,12 @@ from pynput import keyboard
 import logging
 import json
 import pygame
-import io
 import tempfile
 import threading
 import queue
 import wave
 import traceback
 from queue import Queue
-from pydub import AudioSegment
 
 # Load environment variables first
 load_dotenv()
@@ -39,9 +40,92 @@ class VoiceChatClientError(Exception):
     """Custom exception for client errors."""
     pass
 
+class ConfigLoader:
+    """Load and validate YAML configuration files for different VAD scenarios."""
+    
+    @staticmethod
+    def load_config(config_path: str) -> dict:
+        """Load configuration from YAML file.
+        
+        Args:
+            config_path: Path to the YAML configuration file
+            
+        Returns:
+            dict: Loaded configuration
+            
+        Raises:
+            VoiceChatClientError: If configuration is invalid or file not found
+        """
+        try:
+            config_file = Path(config_path)
+            if not config_file.exists():
+                raise VoiceChatClientError(f"Configuration file not found: {config_path}")
+            
+            with open(config_file, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f)
+            
+            # Validate required fields
+            required_fields = ['scenario', 'openai', 'turn_detection', 'audio']
+            for field in required_fields:
+                if field not in config:
+                    raise VoiceChatClientError(f"Missing required field '{field}' in configuration")
+            
+            # Validate scenario
+            valid_scenarios = ['realtime-push-to-talk', 'realtime-server-vad', 'realtime-semantic-vad']
+            if config['scenario'] not in valid_scenarios:
+                raise VoiceChatClientError(f"Invalid scenario '{config['scenario']}'. Must be one of: {valid_scenarios}")
+            
+            # Validate turn_detection type
+            if config['turn_detection']['type'] not in [None, 'server_vad', 'semantic_vad']:
+                raise VoiceChatClientError(f"Invalid turn_detection type: {config['turn_detection']['type']}")
+            
+            logger.info(f"Loaded configuration: {config['scenario']} - {config.get('description', 'No description')}")
+            return config
+            
+        except yaml.YAMLError as e:
+            raise VoiceChatClientError(f"Invalid YAML syntax in {config_path}: {e}")
+        except Exception as e:
+            raise VoiceChatClientError(f"Error loading configuration from {config_path}: {e}")
+    
+    @staticmethod
+    def get_default_config() -> dict:
+        """Get default push-to-talk configuration."""
+        return {
+            'scenario': 'realtime-push-to-talk',
+            'description': 'Default push-to-talk configuration',
+            'openai': {
+                'model': 'gpt-4o-realtime-preview',
+                'voice': 'alloy',
+                'temperature': 0.8,
+                'instructions': 'You are a helpful AI assistant. Respond naturally and conversationally.'
+            },
+            'turn_detection': {
+                'type': None
+            },
+            'audio': {
+                'sample_rate': 24000,
+                'channels': 1,
+                'chunk_size': 1024,
+                'format': 'pcm16'
+            },
+            'ui': {
+                'show_audio_messages': False,
+                'show_system_messages': True,
+                'show_debug_messages': False
+            }
+        }
+
+
 class AzureOpenAIRealtimeClient:
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, yaml_config: dict = None):
+        """Initialize the Azure OpenAI Realtime client.
+        
+        Args:
+            config: Environment configuration (Azure endpoints, etc.)
+            yaml_config: YAML configuration for VAD modes and parameters
+        """
         self.config = config
+        self.yaml_config = yaml_config or ConfigLoader.get_default_config()
         self._websocket_url = self._construct_websocket_url()
 
         self._credential = DefaultAzureCredential()
@@ -61,6 +145,10 @@ class AzureOpenAIRealtimeClient:
 
         # For managing async tasks
         self._tasks = []
+
+        # VAD mode configuration
+        self._vad_mode = self.yaml_config['turn_detection']['type']
+        self._is_push_to_talk = self._vad_mode is None
 
         # Initialize pygame mixer for audio playback - match Azure OpenAI's 24kHz output
         # Use specific settings for Windows compatibility
@@ -87,27 +175,13 @@ class AzureOpenAIRealtimeClient:
         # Current response text buffer
         self._current_response_text = ""
 
-    def _resample_audio_for_openai(self, audio_data: bytes, source_rate: int = 24000, target_rate: int = 24000) -> bytes:
-        """Resample audio data to the format expected by Azure OpenAI Realtime API (24kHz, 16-bit, mono PCM)."""
-        if source_rate == target_rate:
-            return audio_data
-        
-        try:
-            # Create AudioSegment from raw audio data
-            audio_segment = AudioSegment.from_raw(
-                io.BytesIO(audio_data),
-                sample_width=2,  # 16-bit = 2 bytes
-                frame_rate=source_rate,
-                channels=1  # mono
-            )
-            
-            # Resample to target rate
-            resampled_audio = audio_segment.set_frame_rate(target_rate).set_sample_width(2).set_channels(1)
-            return resampled_audio.raw_data
-        except Exception as e:
-            logger.error(f"Error resampling audio: {e}")
-            return audio_data  # Return original if resampling fails
-
+        # Display configuration info
+        self._display_message("status_info", f"Mode: {self.yaml_config['scenario']}")
+        if self.yaml_config.get('description'):
+            self._display_message("status_info", f"Description: {self.yaml_config['description']}")
+        self._display_message("status_info", f"VAD Mode: {self._vad_mode or 'Push-to-Talk'}")
+        self._display_message("status_info", f"Voice: {self.yaml_config['openai']['voice']}")
+        self._display_message("status_info", f"Temperature: {self.yaml_config['openai']['temperature']}")
 
     def _construct_websocket_url(self) -> str:
         endpoint = self.config.get("AZURE_OPENAI_ENDPOINT")
@@ -273,7 +347,7 @@ class AzureOpenAIRealtimeClient:
 
     def _on_keyboard_press(self, key):
         if key == keyboard.Key.space:
-            if not self._is_recording:
+            if self._is_push_to_talk and not self._is_recording:
                 self._display_message("mic_rec_start", "Recording...")
                 self._is_recording = True
                 # Clear any existing audio buffer when starting new recording
@@ -283,12 +357,36 @@ class AzureOpenAIRealtimeClient:
                         loop.create_task(self._clear_audio_buffer())
                     except Exception as e:
                         logger.error(f"Error scheduling audio buffer clear: {e}")
+            elif not self._is_push_to_talk:
+                # In VAD modes, spacebar can be used to manually trigger response
+                if self._ws and not self._ws.closed:
+                    try:
+                        loop = asyncio.get_event_loop()
+                        loop.create_task(self._manual_response_trigger())
+                    except Exception as e:
+                        logger.error(f"Error scheduling manual response trigger: {e}")
         elif hasattr(key, 'char') and key.char == 'q':
             self._display_message("quit", "Quit signal received. Stopping...")
             if not self._quit_event.is_set():
                 self._quit_event.set()
             if self._keyboard_listener: # Attempt to stop listener from its own thread
                  return False
+
+    async def _manual_response_trigger(self):
+        """Manually trigger a response in VAD modes."""
+        if self._ws and not self._ws.closed:
+            try:
+                # Commit the audio buffer and trigger response
+                commit_event = {"type": "input_audio_buffer.commit"}
+                await self._ws.send_json(commit_event)
+                
+                response_event = {"type": "response.create"}
+                await self._ws.send_json(response_event)
+                
+                self._display_message("ai_thinking", "Manual response triggered...")
+                logger.debug("Manually triggered response in VAD mode")
+            except Exception as e:
+                logger.error(f"Error triggering manual response: {e}")
 
     async def _clear_audio_buffer(self):
         """Clear the audio input buffer to start fresh recording."""
@@ -302,7 +400,7 @@ class AzureOpenAIRealtimeClient:
 
 
     def _on_keyboard_release(self, key):
-        if key == keyboard.Key.space:
+        if key == keyboard.Key.space and self._is_push_to_talk:
             if self._is_recording:
                 self._display_message("mic_rec_stop", "Recording stopped.")
                 self._is_recording = False
@@ -310,8 +408,18 @@ class AzureOpenAIRealtimeClient:
 
     async def _audio_capture_loop(self):
         self._display_message("system_event", "Audio capture loop started.")
+        
+        # In VAD modes, we start recording immediately
+        if not self._is_push_to_talk:
+            self._display_message("mic_ready", "Voice activity detection enabled - speak naturally...")
+            self._is_recording = True
+        
         while not self._quit_event.is_set():
-            if self._is_recording and self._pyaudio_stream:
+            should_capture = self._is_recording
+            
+            # In push-to-talk mode, only capture when spacebar is pressed
+            # In VAD modes, capture continuously
+            if should_capture and self._pyaudio_stream:
                 try:
                     # Capture audio chunk (≈ 43ms at 24kHz for 1024 samples)
                     data = await asyncio.to_thread(self._pyaudio_stream.read, PYAUDIO_CHUNK, exception_on_overflow=False)
@@ -371,8 +479,13 @@ class AzureOpenAIRealtimeClient:
         self._display_message("system_event", "Audio streaming loop finished.")
 
     async def _handle_recording_completion(self):
-        """Handle the completion of recording and request AI response."""
-        self._display_message("system_event", "Recording completion handler started.")
+        """Handle the completion of recording and request AI response (push-to-talk mode only)."""
+        if not self._is_push_to_talk:
+            # In VAD modes, recording completion is handled automatically by the server
+            self._display_message("system_event", "Recording completion handler skipped (VAD mode).")
+            return
+            
+        self._display_message("system_event", "Recording completion handler started (push-to-talk mode).")
         
         while not self._quit_event.is_set() and self._ws and not self._ws.closed:
             await self._space_released_event.wait()
@@ -500,6 +613,70 @@ class AzureOpenAIRealtimeClient:
                 self._quit_event.set()
 
 
+    def _construct_session_config(self) -> dict:
+        """Construct session configuration based on YAML config.
+        
+        Returns:
+            dict: Session configuration for OpenAI Realtime API
+        """
+        session_config = {
+            "modalities": ["text", "audio"],
+            "instructions": self.yaml_config['openai']['instructions'],
+            "voice": self.yaml_config['openai']['voice'],
+            "input_audio_format": "pcm16",
+            "output_audio_format": "pcm16",
+            "input_audio_transcription": {
+                "model": "whisper-1"
+            },
+            "temperature": self.yaml_config['openai']['temperature']
+        }
+        
+        # Configure turn detection based on YAML config
+        turn_detection_config = self.yaml_config['turn_detection']
+        
+        if turn_detection_config['type'] is None:
+            # Push-to-talk mode - no automatic turn detection
+            session_config["turn_detection"] = None
+            logger.debug("Configured for push-to-talk mode (no automatic turn detection)")
+            
+        elif turn_detection_config['type'] == 'server_vad':
+            # Server VAD configuration
+            vad_config = {
+                "type": "server_vad"
+            }
+            
+            # Add optional server VAD parameters if specified
+            if 'threshold' in turn_detection_config:
+                vad_config["threshold"] = turn_detection_config['threshold']
+            if 'prefix_padding_ms' in turn_detection_config:
+                vad_config["prefix_padding_ms"] = turn_detection_config['prefix_padding_ms']
+            if 'silence_duration_ms' in turn_detection_config:
+                vad_config["silence_duration_ms"] = turn_detection_config['silence_duration_ms']
+            if 'create_response' in turn_detection_config:
+                vad_config["create_response"] = turn_detection_config['create_response']
+            if 'interrupt_response' in turn_detection_config:
+                vad_config["interrupt_response"] = turn_detection_config['interrupt_response']
+                
+            session_config["turn_detection"] = vad_config
+            logger.debug(f"Configured for server VAD mode: {vad_config}")
+            
+        elif turn_detection_config['type'] == 'semantic_vad':
+            # Semantic VAD configuration
+            vad_config = {
+                "type": "semantic_vad"
+            }
+            
+            # Add optional semantic VAD parameters if specified
+            if 'create_response' in turn_detection_config:
+                vad_config["create_response"] = turn_detection_config['create_response']
+            if 'interrupt_response' in turn_detection_config:
+                vad_config["interrupt_response"] = turn_detection_config['interrupt_response']
+                
+            session_config["turn_detection"] = vad_config
+            logger.debug(f"Configured for semantic VAD mode: {vad_config}")
+        
+        return session_config
+
     async def run(self):
         self._display_message("status_info", "Starting Voice Chat Client...")
         self._pyaudio_instance = pyaudio.PyAudio()
@@ -521,24 +698,27 @@ class AzureOpenAIRealtimeClient:
                     self._ws = ws_connection
                     self._display_message("status_ok", "Successfully connected to Azure OpenAI.")
                     
-                    # Configure session with proper audio format specifications
+                    # Configure session with YAML-based configuration
+                    session_data = self._construct_session_config()
                     session_config = {
                         "type": "session.update",
-                        "session": {
-                            "modalities": ["audio", "text"], 
-                            "turn_detection": {"type": "none"},
-                            "voice": "alloy",  # Request audio responses
-                            "input_audio_format": "pcm16",  # 16-bit PCM
-                            "output_audio_format": "pcm16",  # 16-bit PCM  
-                            "input_audio_transcription": {"model": "whisper-1"}  # Enable transcription
-                        }
+                        "session": session_data
                     }
                     logger.debug(f"Sending session update: {json.dumps(session_config, indent=2)}")
                     
                     await self._ws.send_json(session_config)
-                    self._display_message("status_info", "Sent session configuration (24kHz audio I/O, transcription enabled).")
+                    self._display_message("status_info", f"Sent session configuration ({self.yaml_config['scenario']}).")
 
-                    self._display_message("user_action", "Press SPACEBAR to talk, 'q' to quit.")
+                    # Display appropriate instructions based on VAD mode
+                    if self._is_push_to_talk:
+                        self._display_message("user_action", "Press SPACEBAR to talk, 'q' to quit.")
+                    else:
+                        if self._vad_mode == 'server_vad':
+                            self._display_message("user_action", "Speak naturally (Server VAD enabled). Press SPACEBAR to manually trigger response, 'q' to quit.")
+                        elif self._vad_mode == 'semantic_vad':
+                            self._display_message("user_action", "Speak naturally (Semantic VAD enabled). Press SPACEBAR to manually trigger response, 'q' to quit.")
+                        else:
+                            self._display_message("user_action", "Speak naturally (VAD enabled), 'q' to quit.")
 
                     loop = asyncio.get_event_loop()
                     self._keyboard_listener = keyboard.Listener(
@@ -622,13 +802,66 @@ class AzureOpenAIRealtimeClient:
             self._display_message("quit", "Voice Chat Client shut down gracefully.")
 
 async def main():
+    """Main application function with command line argument support."""
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description='Azure OpenAI Realtime Voice Chat Client with configurable VAD modes',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  python main.py                                    # Use default push-to-talk mode
+  python main.py -f configs/server-vad.yaml        # Use server VAD configuration
+  python main.py -f configs/semantic-vad.yaml      # Use semantic VAD configuration
+  python main.py -f configs/server-vad-sensitive.yaml  # Use sensitive server VAD
+
+Available configurations:
+  - configs/push-to-talk.yaml: Manual push-to-talk mode (spacebar control)
+  - configs/server-vad.yaml: Server-side voice activity detection
+  - configs/semantic-vad.yaml: Semantic voice activity detection
+  - configs/server-vad-sensitive.yaml: High sensitivity server VAD
+  - configs/server-vad-robust.yaml: Low sensitivity server VAD for noisy environments
+        '''
+    )
+    parser.add_argument(
+        '-f', '--config-file',
+        type=str,
+        help='Path to YAML configuration file (default: use built-in push-to-talk config)'
+    )
+    
+    args = parser.parse_args()
+    
+    # Load environment variables
     load_dotenv()
+    
+    # Load YAML configuration
+    yaml_config = None
+    if args.config_file:
+        try:
+            yaml_config = ConfigLoader.load_config(args.config_file)
+        except VoiceChatClientError as e:
+            print(f"❌ Configuration Error: {e}")
+            return
+    else:
+        yaml_config = ConfigLoader.get_default_config()
+        print("ℹ️  Using default push-to-talk configuration. Use -f to specify a config file.")
+    
+    # Load Azure environment configuration
     app_config = {
         "AZURE_OPENAI_ENDPOINT": os.environ.get("AZURE_OPENAI_ENDPOINT"),
         "AZURE_OPENAI_DEPLOYMENT_NAME": os.environ.get("AZURE_OPENAI_DEPLOYMENT_NAME"),
         "OPENAI_API_VERSION": os.environ.get("OPENAI_API_VERSION"),
     }
-    client = AzureOpenAIRealtimeClient(config=app_config)
+    
+    # Validate required environment variables
+    missing_vars = [k for k, v in app_config.items() if not v]
+    if missing_vars:
+        print(f"❌ Missing required environment variables: {', '.join(missing_vars)}")
+        print("Please check your .env file or environment variables.")
+        return
+    
+    # Create and run client
+    client = AzureOpenAIRealtimeClient(config=app_config, yaml_config=yaml_config)
     try:
         await client.run()
     except Exception as e: # Catch-all for unexpected errors during client.run() setup or early exit
