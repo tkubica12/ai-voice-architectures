@@ -1,0 +1,53 @@
+# Azure Semantic VAD Multilingual Configuration
+# This mode supports multiple languages for VAD detection
+# Supports: English, Spanish, French, Italian, German, Japanese, Portuguese, Chinese, Korean, Hindi
+
+scenario: "voicelive-azure-semantic-vad-multilingual"
+description: "Multilingual Azure semantic VAD for international conversations"
+
+# Model configuration
+model: "gpt-4o"
+
+# Voice configuration - using a multilingual-capable voice
+voice:
+  name: "en-US-Ava:DragonHDLatestNeural"
+  type: "azure-standard"
+  temperature: 0.8
+  locale: "cs-CZ"  # Force Czech locale for Czech language output
+
+# Turn Detection Configuration - Azure Semantic VAD Multilingual
+turn_detection:
+  type: "azure_semantic_vad_multilingual"
+  threshold: 0.3
+  prefix_padding_ms: 200
+  silence_duration_ms: 300
+  remove_filler_words: true
+  interrupt_response: true
+  
+  # Supported languages for filler word removal
+  languages:
+    - "en"  # English
+    - "cs"  # Czech (via English model)
+    - "de"  # German
+    - "es"  # Spanish
+  
+  # End of utterance detection with multilingual model
+  end_of_utterance_detection:
+    model: "semantic_detection_v1_multilingual"
+    threshold_level: "default"
+    timeout_ms: 1000
+
+# Audio processing configuration
+audio:
+  echo_cancellation: true
+  noise_reduction: true
+  noise_reduction_type: "azure_deep_noise_suppression"
+
+# Input audio transcription configuration
+transcription:
+  enabled: true
+  model: "azure-speech"  # Use azure-speech for non-realtime models
+  language: "cs,en,de,es"  # Multi-language detection for multilingual VAD
+
+# Proactive greeting
+proactive_greeting: true

@@ -1,0 +1,39 @@
+# GPT Realtime Model Configuration
+# This configuration uses the GPT Realtime model with native audio capabilities
+# Best for low-latency conversational experiences
+
+scenario: "voicelive-gpt-realtime"
+description: "GPT Realtime model with Azure HD voice for low-latency conversations"
+
+# Model configuration - GPT Realtime has native audio understanding
+model: "gpt-realtime"
+
+# Voice configuration - High Definition Azure voice
+voice:
+  name: "en-US-Ava:DragonHDLatestNeural"
+  type: "azure-standard"
+  temperature: 0.9  # Higher temperature for more expressive speech
+  rate: "1.0"  # Normal speaking rate
+  locale: "cs-CZ"  # Force Czech locale for Czech language output
+
+# Turn Detection Configuration - Server VAD works well with realtime
+turn_detection:
+  type: "server_vad"
+  threshold: 0.5
+  prefix_padding_ms: 300
+  silence_duration_ms: 500
+
+# Audio processing configuration
+audio:
+  echo_cancellation: true
+  noise_reduction: true
+  noise_reduction_type: "azure_deep_noise_suppression"
+
+# Input audio transcription configuration
+transcription:
+  enabled: true
+  model: "gpt-4o-transcribe"  # Use gpt-4o-transcribe for realtime models
+  language: "cs"  # BCP-47 (e.g., en-US) or ISO-639-1 (e.g., en), or multi-languages (e.g., en,cs)
+
+# Proactive greeting
+proactive_greeting: true

@@ -1,0 +1,44 @@
+# GPT-4.1 Model Configuration
+# Uses GPT-4.1 with Azure Speech to Text and Text to Speech
+# Optimized for high-quality conversational AI
+
+scenario: "voicelive-gpt-4-1"
+description: "GPT-4.1 model with Azure Speech services for premium quality"
+
+# Model configuration
+model: "gpt-4.1"
+
+# Voice configuration
+voice:
+  name: "en-US-AvaNeural"
+  type: "azure-standard"
+  locale: "cs-CZ"  # Force Czech locale for Czech language output
+
+# Turn Detection Configuration - Azure Semantic VAD for best quality
+turn_detection:
+  type: "azure_semantic_vad"
+  threshold: 0.4
+  prefix_padding_ms: 250
+  silence_duration_ms: 400
+  remove_filler_words: true
+  interrupt_response: true
+  
+  end_of_utterance_detection:
+    model: "semantic_detection_v1"
+    threshold_level: "medium"
+    timeout_ms: 800
+
+# Audio processing configuration
+audio:
+  echo_cancellation: true
+  noise_reduction: true
+  noise_reduction_type: "azure_deep_noise_suppression"
+
+# Input audio transcription configuration
+transcription:
+  enabled: true
+  model: "azure-speech"  # Use azure-speech for non-realtime models
+  language: "cs"
+
+# Proactive greeting
+proactive_greeting: true

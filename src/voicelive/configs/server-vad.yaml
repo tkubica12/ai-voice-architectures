@@ -1,0 +1,38 @@
+# Server VAD Configuration
+# This mode uses server-side voice activity detection
+# The server automatically detects speech based on silence periods
+
+scenario: "voicelive-server-vad"
+description: "Server-side voice activity detection with automatic turn detection"
+
+# Model configuration
+model: "gpt-4o"
+
+# Voice configuration
+voice:
+  name: "en-US-Ava:DragonHDLatestNeural"
+  type: "azure-standard"
+  temperature: 0.8
+  locale: "cs-CZ"  # Force Czech locale for Czech language output
+
+# Turn Detection Configuration
+turn_detection:
+  type: "server_vad"
+  threshold: 0.5  # Range: 0.0-1.0. Higher = less sensitive
+  prefix_padding_ms: 300  # Audio to include before detected speech (ms)
+  silence_duration_ms: 500  # Duration of silence to detect speech stop (ms)
+
+# Audio processing configuration
+audio:
+  echo_cancellation: true
+  noise_reduction: true
+  noise_reduction_type: "azure_deep_noise_suppression"
+
+# Input audio transcription configuration
+transcription:
+  enabled: true
+  model: "azure-speech"  # Use azure-speech for non-realtime models
+  language: "cs"
+
+# Proactive greeting - whether AI speaks first
+proactive_greeting: true

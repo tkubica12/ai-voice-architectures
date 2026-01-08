@@ -1,0 +1,16 @@
+[project]
+name = "voicelive"
+version = "0.1.0"
+description = "Azure Voice Live API real-time voice assistant with configurable modes"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "azure-ai-voicelive[aiohttp]>=1.0.0",
+    "azure-identity>=1.23.0",
+    "python-dotenv>=1.1.0",
+    "pyaudio>=0.2.14",
+    "pynput>=1.7.6",
+    "numpy>=1.26.0",
+    "pyyaml>=6.0.0",
+    "jinja2>=3.1.0",
+]

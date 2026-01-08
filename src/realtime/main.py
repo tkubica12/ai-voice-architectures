@@ -1,22 +1,27 @@
 import os
 import asyncio
-import aiohttp
 import base64
 import argparse
 import yaml
+import uuid
 from pathlib import Path
 from dotenv import load_dotenv
-from azure.identity.aio import DefaultAzureCredential, get_bearer_token_provider
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+from openai import AsyncOpenAI
 import pyaudio
 from pynput import keyboard
 import logging
 import json
-import pygame
+import sounddevice as sd
+import numpy as np
 import tempfile
 import threading
 import queue
 import wave
 import traceback
+import subprocess
+import time
 from queue import Queue
 
 # Load environment variables first
@@ -51,7 +56,11 @@ class AzureOpenAIRealtimeClient:
         """
         self.config = config
         self.yaml_config = yaml_config or {}
-        self._websocket_url = self._construct_websocket_url()
+        self._base_url = self._construct_base_url()
+        self._deployment_name = config.get("AZURE_OPENAI_DEPLOYMENT_NAME")
+        
+        if not self._deployment_name:
+            raise VoiceChatClientError("Missing AZURE_OPENAI_DEPLOYMENT_NAME configuration variable.")
 
         self._credential = DefaultAzureCredential()
         self._token_provider = get_bearer_token_provider(
@@ -66,7 +75,7 @@ class AzureOpenAIRealtimeClient:
         self._audio_chunk_queue = asyncio.Queue()  # For streaming audio chunks
         self._space_released_event = asyncio.Event()
         self._quit_event = asyncio.Event()
-        self._ws = None # WebSocket connection
+        self._connection = None  # OpenAI Realtime connection
 
         # For managing async tasks
         self._tasks = []
@@ -74,31 +83,47 @@ class AzureOpenAIRealtimeClient:
         # VAD mode configuration
         self._vad_mode = self.yaml_config.get('turn_detection', {}).get('type')
         self._is_push_to_talk = self._vad_mode is None
+        
+        # Load system prompt template
+        self._system_prompt = self._load_system_prompt()
 
-        # Initialize pygame mixer for audio playback - match Azure OpenAI's 24kHz output
-        # Use specific settings for Windows compatibility
+        # Initialize sounddevice for audio playback - direct streaming without temp files
+        # This is much better for Bluetooth as it doesn't create file I/O overhead
         try:
-            pygame.mixer.pre_init(frequency=24000, size=-16, channels=1, buffer=512)
-            pygame.mixer.init()
-            # Set mixer volume to maximum
-            pygame.mixer.set_num_channels(8)  # Allow multiple concurrent sounds
-            logger.debug("Pygame mixer initialized successfully")
-        except pygame.error as e:
-            logger.error(f"Failed to initialize pygame mixer: {e}")
-            # Try fallback initialization
-            try:
-                pygame.mixer.init(frequency=22050, size=-16, channels=2, buffer=1024)
-                logger.debug("Pygame mixer initialized with fallback settings")
-            except pygame.error as e2:
-                logger.error(f"Pygame mixer fallback also failed: {e2}")
+            # Configure sounddevice for real-time audio streaming
+            sd.default.samplerate = 24000
+            sd.default.channels = 1
+            sd.default.dtype = 'int16'
+            # Larger latency for Bluetooth stability
+            sd.default.latency = 'high'  # Use system's high-latency setting
+            
+            # Test audio output
+            devices = sd.query_devices()
+            logger.debug(f"Audio output device: {sd.default.device}")
+            logger.debug("Sounddevice initialized for direct audio streaming")
+        except Exception as e:
+            logger.error(f"Failed to initialize sounddevice: {e}")
+            raise VoiceChatClientError(f"Audio initialization failed: {e}")
         
         # Audio playback queue and thread
         self._audio_playback_queue = Queue()
         self._audio_playback_thread = None
         self._stop_audio_playback = threading.Event()
+        self._interrupt_audio_playback = threading.Event()  # For interrupting current playback
+        
+        # Audio streaming with sounddevice - no file creation needed
+        self._audio_stream = None
+        self._audio_queue_sd = queue.Queue(maxsize=100)
+        self._stream_lock = threading.Lock()
 
         # Current response text buffer
         self._current_response_text = ""
+        
+        # Function calling configuration
+        self._function_call_attempt_counter = 0  # Round-robin counter for mock
+        self._async_completion_delay = 10.0  # Delay for async job completion in seconds
+        self._pending_jobs = {}  # Track pending async jobs: {job_id: result}
+        self._response_active = False  # Track if a response is currently active
 
         # Display configuration info
         if self.yaml_config.get('scenario'):
@@ -107,22 +132,84 @@ class AzureOpenAIRealtimeClient:
             self._display_message("status_info", f"Description: {self.yaml_config['description']}")
         self._display_message("status_info", f"VAD Mode: {self._vad_mode or 'Push-to-Talk'}")
         self._display_message("status_info", f"Voice: alloy")
-        self._display_message("status_info", f"Temperature: 0.8")
+        self._display_message("status_info", f"Audio: Direct streaming (sounddevice)")
+        self._display_message("status_info", f"Sample rate: 24kHz, Latency: high (Bluetooth optimized)")
 
-    def _construct_websocket_url(self) -> str:
+    def _load_system_prompt(self) -> str:
+        """Load and render system prompt from Jinja2 template.
+        
+        Returns:
+            str: Rendered system prompt
+        """
+        try:
+            # Get template directory
+            template_dir = Path(__file__).parent / "templates"
+            
+            # Set up Jinja2 environment
+            env = Environment(
+                loader=FileSystemLoader(template_dir),
+                autoescape=select_autoescape(['html', 'xml'])
+            )
+            
+            # Load template
+            template = env.get_template('system_prompt.j2')
+            
+            # Render with any context variables from YAML config
+            context = self.yaml_config.get('prompt_context', {})
+            rendered_prompt = template.render(**context)
+            
+            logger.debug(f"Loaded system prompt from template ({len(rendered_prompt)} chars)")
+            return rendered_prompt
+            
+        except Exception as e:
+            logger.warning(f"Failed to load system prompt template: {e}")
+            # Fallback to default prompt
+            return "You are a helpful AI assistant. Respond naturally and conversationally."
+    
+    def _load_system_prompt(self) -> str:
+        """Load and render system prompt from Jinja2 template.
+        
+        Returns:
+            str: Rendered system prompt
+        """
+        try:
+            # Get template directory
+            template_dir = Path(__file__).parent / "templates"
+            
+            # Set up Jinja2 environment
+            env = Environment(
+                loader=FileSystemLoader(template_dir),
+                autoescape=select_autoescape(['html', 'xml'])
+            )
+            
+            # Load template
+            template = env.get_template('system_prompt.j2')
+            
+            # Render with any context variables from YAML config
+            context = self.yaml_config.get('prompt_context', {})
+            rendered_prompt = template.render(**context)
+            
+            logger.debug(f"Loaded system prompt from template ({len(rendered_prompt)} chars)")
+            return rendered_prompt
+            
+        except Exception as e:
+            logger.warning(f"Failed to load system prompt template: {e}")
+            # Fallback to default prompt
+            return "You are a helpful AI assistant. Respond naturally and conversationally."
+    
+    def _construct_base_url(self) -> str:
+        """Construct base URL for OpenAI client."""
         endpoint = self.config.get("AZURE_OPENAI_ENDPOINT")
-        deployment = self.config.get("AZURE_OPENAI_DEPLOYMENT_NAME")
-        api_version = self.config.get("OPENAI_API_VERSION")
 
-        if not all([endpoint, deployment, api_version]):
-            raise VoiceChatClientError("Missing Azure OpenAI configuration variables.")
+        if not endpoint:
+            raise VoiceChatClientError("Missing AZURE_OPENAI_ENDPOINT configuration variable.")
 
-        hostname = endpoint.replace("https://", "").replace("http://", "").rstrip("/")
-        return f"wss://{hostname}/openai/realtime?api-version={api_version}&deployment={deployment}"
+        # Convert https:// to wss:// and add /openai/v1 path
+        return endpoint.replace("https://", "wss://").rstrip("/") + "/openai/v1"
 
-    async def _get_auth_headers(self) -> dict:
-        access_token = await self._token_provider()
-        return {"Authorization": f"Bearer {access_token}"}
+    async def _get_auth_token(self) -> str:
+        """Get authentication token for OpenAI client."""
+        return self._token_provider()
 
     def _display_message(self, m_type: str, content: str = "", end: str = '\n', flush: bool = False):
         """Handles all console output with emojis."""
@@ -145,119 +232,90 @@ class AzureOpenAIRealtimeClient:
         else:
             print(f"{prefix} {content}", end=end, flush=force_flush)
 
-    def _audio_playback_worker(self):
-        """Background thread worker for audio playback."""
-        while not self._stop_audio_playback.is_set():
-            try:
-                # Get audio data from queue with timeout
-                audio_data = self._audio_playback_queue.get(timeout=0.1)
-                if audio_data is None:  # Poison pill to stop thread
-                    break
-                
-                logger.debug(f"Processing audio chunk for playback: {len(audio_data)} bytes")
-                
-                # Create a proper WAV file with headers
-                temp_file_path = None
-                try:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
-                        temp_file_path = temp_file.name
-                        
-                    # Create a WAV file with proper headers
-                    # Azure OpenAI sends PCM audio at 24kHz, 16-bit, mono
-                    sample_rate = 24000
-                    channels = 1
-                    sample_width = 2  # 16-bit = 2 bytes
-                    
-                    with wave.open(temp_file_path, 'wb') as wav_file:
-                        wav_file.setnchannels(channels)
-                        wav_file.setsampwidth(sample_width)
-                        wav_file.setframerate(sample_rate)
-                        wav_file.writeframes(audio_data)
-                    
-                    logger.debug(f"Created WAV file: {temp_file_path}")
-                    
-                    # Load and play the audio with volume boost
-                    sound = pygame.mixer.Sound(temp_file_path)
-                    
-                    # Set volume to maximum
-                    sound.set_volume(1.0)
-                    
-                    # Play the sound
-                    channel = sound.play()
-                    logger.debug(f"Started audio playback on channel: {channel}")
-                    
-                    # Wait for the sound to finish playing
-                    while pygame.mixer.get_busy():
-                        if self._stop_audio_playback.is_set():
-                            pygame.mixer.stop()
-                            break
-                        pygame.time.wait(10)
-                    
-                    logger.debug("Audio playback completed")
-                        
-                except (pygame.error, wave.Error) as e:
-                    logger.error(f"Error playing audio: {e}")
-                    # Try alternative playback method
-                    self._try_alternative_playback(audio_data)
-                except Exception as e:
-                    logger.error(f"Unexpected error in audio playback: {e}")
-                finally:
-                    # Clean up temporary file
-                    if temp_file_path:
-                        try:
-                            os.unlink(temp_file_path)
-                        except OSError:
-                            pass
-                        
-                self._audio_playback_queue.task_done()
-                
-            except queue.Empty:
-                continue
-            except Exception as e:
-                if not self._stop_audio_playback.is_set():
-                    logger.error(f"Error in audio playback worker: {e}")
-                continue
-
-    def _try_alternative_playback(self, audio_data: bytes):
-        """Try alternative audio playback using system commands."""
+    def _audio_callback(self, outdata, frames, time_info, status):
+        """Sounddevice callback for audio playback - called by audio system."""
+        if status:
+            logger.debug(f"Audio callback status: {status}")
+        
         try:
-            # Create temporary WAV file
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
-                temp_file_path = temp_file.name
-                
-            # Write WAV data
-            with wave.open(temp_file_path, 'wb') as wav_file:
-                wav_file.setnchannels(1)  # mono
-                wav_file.setsampwidth(2)  # 16-bit
-                wav_file.setframerate(24000)  # 24kHz
-                wav_file.writeframes(audio_data)
+            # Get audio data from queue
+            data = self._audio_queue_sd.get_nowait()
+            # Convert bytes to numpy array
+            audio_array = np.frombuffer(data, dtype=np.int16)
             
-            # Try playing with system command
-            import subprocess
-            if os.name == 'nt':  # Windows
-                subprocess.run(['powershell', '-c', f'(New-Object Media.SoundPlayer "{temp_file_path}").PlaySync()'], 
-                             check=False, capture_output=True)
-            
-            # Clean up
-            try:
-                os.unlink(temp_file_path)
-            except OSError:
-                pass
+            # Fill output buffer
+            if len(audio_array) < len(outdata):
+                # Pad with zeros if not enough data
+                outdata[:len(audio_array)] = audio_array.reshape(-1, 1)
+                outdata[len(audio_array):] = 0
+            else:
+                outdata[:] = audio_array[:len(outdata)].reshape(-1, 1)
                 
+        except queue.Empty:
+            # No data available - output silence
+            outdata.fill(0)
+    
+    def _audio_playback_worker(self):
+        """Background thread worker for audio streaming with sounddevice."""
+        try:
+            # Start audio stream without callback - we'll write directly
+            with sd.OutputStream(samplerate=24000, channels=1, dtype='int16',
+                               blocksize=0,  # Auto blocksize
+                               latency='high') as stream:
+                logger.debug("Audio stream started")
+                
+                # Buffer to accumulate audio for smooth playback
+                audio_buffer = bytearray()
+                min_buffer_size = 9600  # 200ms worth of audio (24000 * 2 bytes * 0.2)
+                
+                # Process audio data from queue
+                while not self._stop_audio_playback.is_set():
+                    try:
+                        # Get audio data from main queue
+                        audio_data = self._audio_playback_queue.get(timeout=0.1)
+                        if audio_data is None:  # Poison pill
+                            break
+                        
+                        # Add to buffer
+                        audio_buffer.extend(audio_data)
+                        self._audio_playback_queue.task_done()
+                        
+                        # Play accumulated audio when we have enough
+                        while len(audio_buffer) >= min_buffer_size:
+                            # Extract chunk to play
+                            chunk = bytes(audio_buffer[:min_buffer_size])
+                            audio_buffer = audio_buffer[min_buffer_size:]
+                            
+                            # Convert to numpy array and play
+                            audio_array = np.frombuffer(chunk, dtype=np.int16).reshape(-1, 1)
+                            stream.write(audio_array)
+                            logger.debug(f"Played {len(chunk)} bytes")
+                        
+                    except queue.Empty:
+                        # Play any remaining audio in buffer during idle
+                        if len(audio_buffer) > 0:
+                            chunk = bytes(audio_buffer)
+                            audio_buffer.clear()
+                            audio_array = np.frombuffer(chunk, dtype=np.int16).reshape(-1, 1)
+                            stream.write(audio_array)
+                        continue
+                        
         except Exception as e:
-            logger.error(f"Alternative playback also failed: {e}")
+            logger.error(f"Error in audio playback worker: {e}")
+        finally:
+            logger.debug("Audio stream stopped")
 
     def _play_audio(self, audio_data: bytes):
         """Queue audio data for playback."""
         if not self._stop_audio_playback.is_set():
             logger.debug(f"Queuing audio data for playback: {len(audio_data)} bytes")
             self._audio_playback_queue.put(audio_data)
-            # Removed audio queue message display for cleaner output
 
     def _start_audio_playback_thread(self):
         """Start the audio playback thread."""
         if self._audio_playback_thread is None or not self._audio_playback_thread.is_alive():
             self._stop_audio_playback.clear()
+            self._interrupt_audio_playback.clear()
             self._audio_playback_thread = threading.Thread(target=self._audio_playback_worker, daemon=True)
             self._audio_playback_thread.start()
             self._display_message("system_event", "Audio playback thread started.")
@@ -266,10 +324,37 @@ class AzureOpenAIRealtimeClient:
         """Stop the audio playback thread."""
         if self._audio_playback_thread and self._audio_playback_thread.is_alive():
             self._stop_audio_playback.set()
+            self._interrupt_audio_playback.set()
             self._audio_playback_queue.put(None)  # Poison pill
             self._audio_playback_thread.join(timeout=2.0)
             self._display_message("system_event", "Audio playback thread stopped.")
 
+    def _flush_audio_playback_buffer(self):
+        """Flush the audio playback buffer and stop current playback for interruption."""
+        logger.debug("Flushing audio playback buffer due to interruption")
+        
+        # Clear the sounddevice queue
+        try:
+            while not self._audio_queue_sd.empty():
+                try:
+                    self._audio_queue_sd.get_nowait()
+                except queue.Empty:
+                    break
+        except Exception as e:
+            logger.debug(f"Error clearing audio queue: {e}")
+        
+        # Also clear the main playback queue
+        try:
+            while not self._audio_playback_queue.empty():
+                try:
+                    self._audio_playback_queue.get_nowait()
+                    self._audio_playback_queue.task_done()
+                except queue.Empty:
+                    break
+        except Exception as e:
+            logger.debug(f"Error clearing playback queue: {e}")
+            
+        self._display_message("system_event", "Audio playback interrupted and buffer flushed")
 
     def _on_keyboard_press(self, key):
         if key == keyboard.Key.space:
@@ -277,7 +362,7 @@ class AzureOpenAIRealtimeClient:
                 self._display_message("mic_rec_start", "Recording...")
                 self._is_recording = True
                 # Clear any existing audio buffer when starting new recording
-                if self._ws and not self._ws.closed:
+                if self._connection:
                     try:
                         loop = asyncio.get_event_loop()
                         loop.create_task(self._clear_audio_buffer())
@@ -285,7 +370,9 @@ class AzureOpenAIRealtimeClient:
                         logger.error(f"Error scheduling audio buffer clear: {e}")
             elif not self._is_push_to_talk:
                 # In VAD modes, spacebar can be used to manually trigger response
-                if self._ws and not self._ws.closed:
+                # Also interrupt current AI playback when user wants to speak
+                self._handle_user_interruption()
+                if self._connection:
                     try:
                         loop = asyncio.get_event_loop()
                         loop.create_task(self._manual_response_trigger())
@@ -300,14 +387,11 @@ class AzureOpenAIRealtimeClient:
 
     async def _manual_response_trigger(self):
         """Manually trigger a response in VAD modes."""
-        if self._ws and not self._ws.closed:
+        if self._connection:
             try:
-                # Commit the audio buffer and trigger response
-                commit_event = {"type": "input_audio_buffer.commit"}
-                await self._ws.send_json(commit_event)
-                
-                response_event = {"type": "response.create"}
-                await self._ws.send_json(response_event)
+                # Commit the audio buffer and trigger response using OpenAI SDK
+                await self._connection.input_audio_buffer.commit()
+                await self._connection.response.create()
                 
                 self._display_message("ai_thinking", "Manual response triggered...")
                 logger.debug("Manually triggered response in VAD mode")
@@ -316,10 +400,9 @@ class AzureOpenAIRealtimeClient:
 
     async def _clear_audio_buffer(self):
         """Clear the audio input buffer to start fresh recording."""
-        if self._ws and not self._ws.closed:
+        if self._connection:
             try:
-                clear_event = {"type": "input_audio_buffer.clear"}
-                await self._ws.send_json(clear_event)
+                await self._connection.input_audio_buffer.clear()
                 logger.debug("Cleared input audio buffer")
             except Exception as e:
                 logger.error(f"Error clearing audio buffer: {e}")
@@ -370,27 +453,22 @@ class AzureOpenAIRealtimeClient:
 
 
     async def _stream_audio_loop(self):
-        """Stream audio chunks to OpenAI using input_audio_buffer.append events."""
+        """Stream audio chunks to OpenAI using SDK's append method."""
         self._display_message("system_event", "Audio streaming loop started.")
         
-        while not self._quit_event.is_set() and self._ws and not self._ws.closed:
+        while not self._quit_event.is_set() and self._connection:
             try:
                 # Get audio chunk from queue (blocks until available)
                 audio_chunk = await asyncio.wait_for(self._audio_chunk_queue.get(), timeout=0.1)
                 
-                if self._quit_event.is_set() or not self._ws or self._ws.closed:
+                if self._quit_event.is_set() or not self._connection:
                     break
                 
                 # Encode audio chunk as base64
                 audio_base64 = base64.b64encode(audio_chunk).decode('utf-8')
                 
-                # Send audio chunk using input_audio_buffer.append
-                audio_event = {
-                    "type": "input_audio_buffer.append",
-                    "audio": audio_base64
-                }
-                
-                await self._ws.send_json(audio_event)
+                # Send audio chunk using OpenAI SDK
+                await self._connection.input_audio_buffer.append(audio=audio_base64)
                 logger.debug(f"Streamed {len(audio_chunk)} bytes of audio data")
                 
                 self._audio_chunk_queue.task_done()
@@ -413,26 +491,24 @@ class AzureOpenAIRealtimeClient:
             
         self._display_message("system_event", "Recording completion handler started (push-to-talk mode).")
         
-        while not self._quit_event.is_set() and self._ws and not self._ws.closed:
+        while not self._quit_event.is_set() and self._connection:
             await self._space_released_event.wait()
             self._space_released_event.clear()
 
-            if self._quit_event.is_set() or not self._ws or self._ws.closed: 
+            if self._quit_event.is_set() or not self._connection: 
                 break
 
             # Commit the audio buffer and request response
             self._display_message("audio_send", "Finalizing audio input...")
             
             try:
-                # Commit the audio buffer
-                commit_event = {"type": "input_audio_buffer.commit"}
-                await self._ws.send_json(commit_event)
-                logger.debug("Sent input_audio_buffer.commit")
+                # Commit the audio buffer using OpenAI SDK
+                await self._connection.input_audio_buffer.commit()
+                logger.debug("Committed input audio buffer")
                 
-                # Request AI response
-                response_create = {"type": "response.create"}
-                await self._ws.send_json(response_create)
-                logger.debug("Sent response.create")
+                # Request AI response using OpenAI SDK
+                await self._connection.response.create()
+                logger.debug("Created response request")
                 
                 self._display_message("ai_thinking", "Audio submitted, waiting for AI response...")
                 
@@ -443,91 +519,107 @@ class AzureOpenAIRealtimeClient:
         self._display_message("system_event", "Recording completion handler finished.")
 
     async def _receive_server_messages_loop(self):
-        """Receive server messages loop with debug logging."""
+        """Receive server messages using OpenAI SDK event stream."""
         self._display_message("system_event", "Message receiving loop started.")
         try:
-            async for msg in self._ws: # type: ignore
+            async for event in self._connection:
                 if self._quit_event.is_set(): 
                     break
 
-                logger.debug(f"WebSocket message type: {msg.type}")
+                logger.debug(f"Received event type: {event.type}")
                 
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    try:
-                        data = msg.json()
-                        logger.debug(f"Received JSON message: {json.dumps(data, indent=2)}")
-                        
-                        msg_type = data.get("type")
-                        if msg_type == "response.text.delta":
-                            # Accumulate text for clean display
-                            delta_text = data.get("delta", "")
-                            self._current_response_text += delta_text
-                            self._display_message("ai_resp_text_delta", delta_text, end="", flush=True)
-                        elif msg_type == "response.text.done":
-                            logger.debug("AI text response completed")
-                            self._display_message("ai_resp_text_delta", "", end='\n')
-                            self._current_response_text = ""  # Reset for next response
-                        elif msg_type == "response.audio.delta":
-                            # Handle audio data chunks - decode base64 and queue for playback
-                            audio_b64 = data.get("delta", "")
-                            if audio_b64:
-                                try:
-                                    audio_bytes = base64.b64decode(audio_b64)
-                                    self._play_audio(audio_bytes)
-                                    logger.debug(f"Queued {len(audio_bytes)} bytes of audio for playback")
-                                except Exception as e:
-                                    logger.warning(f"Failed to decode audio delta: {e}")
-                        elif msg_type == "response.audio.done":
-                            logger.debug("AI audio response completed")
-                            # Removed audio playback complete message for cleaner output
-                        elif msg_type == "response.audio_transcript.delta":
-                            # Display transcript text cleanly without prefix
-                            transcript_text = data.get("delta", "")
-                            self._display_message("ai_resp_text_delta", transcript_text, end="", flush=True)
-                        elif msg_type == "response.audio_transcript.done":
-                            logger.debug("AI audio transcript completed")
-                            self._display_message("ai_resp_text_delta", " [Done]", end='\n')
-                        elif msg_type == "response.done":
-                            logger.debug("AI response completed")
-                            self._display_message("status_ok", "--- End of AI Response ---")
-                        elif msg_type == "error":
-                            error_msg = data.get('message', 'Unknown error')
-                            error_code = data.get('code', 'No code')
-                            error_details = data.get('details', 'No details')
-                            logger.error(f"Server error - Code: {error_code}, Message: {error_msg}, Details: {error_details}")
-                            logger.debug(f"Full error response: {json.dumps(data, indent=2)}")
-                            self._display_message("status_error", f"Server error: {error_msg}")
-                            self._quit_event.set()
-                            break
-                        elif msg_type == "session.created":
-                            logger.debug(f"Session created: {data.get('session', {})}")
-                        elif msg_type == "session.updated":
-                            logger.debug(f"Session updated: {data.get('session', {})}")
-                        elif msg_type == "conversation.item.created":
-                            logger.debug(f"Conversation item created: {data.get('item', {})}")
-                        elif msg_type == "response.created":
-                            logger.debug(f"Response created: {data.get('response', {})}")
-                        else:
-                            logger.debug(f"Unhandled message type: {msg_type}")
-                    except ValueError as e:
-                        logger.warning(f"Failed to parse JSON message: {e}")
-                        logger.debug(f"Raw message data: {msg.data}")
-                        self._display_message("status_warn", f"Received non-JSON text: {msg.data}")
-                elif msg.type == aiohttp.WSMsgType.BINARY:
-                    logger.debug(f"Received {len(msg.data)} bytes of binary data")
-                    # Handle binary audio data - directly queue for playback
-                    self._play_audio(msg.data)
-                    self._display_message("ai_resp_audio", f"Playing {len(msg.data)} bytes of binary audio data.")
-                elif msg.type == aiohttp.WSMsgType.ERROR:
-                    logger.error(f"WebSocket connection error: {self._ws.exception()}")
-                    self._display_message("status_error", f"WebSocket connection error: {self._ws.exception()}")
+                msg_type = event.type
+                
+                # Handle different event types using OpenAI SDK patterns
+                if msg_type == "response.text.delta":
+                    # Accumulate text for clean display
+                    delta_text = event.delta
+                    self._current_response_text += delta_text
+                    self._display_message("ai_resp_text_delta", delta_text, end="", flush=True)
+                elif msg_type == "response.text.done":
+                    logger.debug("AI text response completed")
+                    self._display_message("ai_resp_text_delta", "", end='\n')
+                    self._current_response_text = ""  # Reset for next response
+                elif msg_type == "response.output_audio.delta":
+                    # Handle audio data chunks - SDK provides base64 string
+                    audio_b64 = event.delta
+                    if audio_b64:
+                        try:
+                            audio_bytes = base64.b64decode(audio_b64)
+                            self._play_audio(audio_bytes)
+                            logger.debug(f"Queued {len(audio_bytes)} bytes of audio for playback")
+                        except Exception as e:
+                            logger.warning(f"Failed to decode audio delta: {e}")
+                elif msg_type == "response.output_audio.done":
+                    logger.debug("AI audio response completed")
+                    # Removed audio playback complete message for cleaner output
+                elif msg_type == "response.output_audio_transcript.delta":
+                    # Display transcript text cleanly without prefix
+                    transcript_text = event.delta
+                    self._display_message("ai_resp_text_delta", transcript_text, end="", flush=True)
+                elif msg_type == "response.output_audio_transcript.done":
+                    logger.debug("AI audio transcript completed")
+                    self._display_message("ai_resp_text_delta", " [Done]", end='\n')
+                elif msg_type == "response.done":
+                    logger.debug("AI response completed")
+                    self._response_active = False
+                    self._display_message("status_ok", "--- End of AI Response ---")
+                elif msg_type == "conversation.interrupted":
+                    logger.debug("Conversation interrupted by server")
+                    self._display_message("system_event", "🛑 AI response interrupted")
+                    # Flush audio playback buffer to stop current playback immediately
+                    self._flush_audio_playback_buffer()
+                elif msg_type == "response.cancelled":
+                    logger.debug("AI response cancelled by server")
+                    self._response_active = False
+                    self._display_message("system_event", "🛑 AI response cancelled")
+                    # Flush audio playback buffer to stop current playback immediately
+                    self._flush_audio_playback_buffer()
+                elif msg_type == "input_audio_buffer.speech_started":
+                    logger.debug("User speech detected - interrupting AI playback")
+                    self._display_message("system_event", "🎤 Speech detected - interrupting AI")
+                    # Handle user interruption when speech is detected
+                    self._handle_user_interruption()
+                elif msg_type == "error":
+                    error_msg = event.error.message if hasattr(event.error, 'message') else 'Unknown error'
+                    error_code = event.error.code if hasattr(event.error, 'code') else 'No code'
+                    
+                    # Handle benign errors that shouldn't stop the application
+                    if error_code == "response_cancel_not_active":
+                        # This is expected when user speaks but AI isn't responding yet
+                        logger.debug(f"Benign error - {error_code}: {error_msg}")
+                        continue
+                    
+                    # Fatal errors that should stop the application
+                    logger.error(f"Server error - Code: {error_code}, Message: {error_msg}")
+                    self._display_message("status_error", f"Server error: {error_msg}")
                     self._quit_event.set()
                     break
-                elif msg.type == aiohttp.WSMsgType.CLOSED:
-                    logger.info("WebSocket connection closed by server")
-                    self._display_message("status_info", "WebSocket connection closed by server.")
-                    self._quit_event.set()
-                    break
+                elif msg_type == "session.created":
+                    logger.debug(f"Session created: {event.session.id}")
+                elif msg_type == "session.updated":
+                    logger.debug(f"Session updated: {event.session.id}")
+                elif msg_type == "conversation.item.created":
+                    logger.debug(f"Conversation item created")
+                elif msg_type == "response.created":
+                    logger.debug(f"Response created")
+                    self._response_active = True
+                elif msg_type == "response.function_call_arguments.done":
+                    # Function call with complete arguments
+                    logger.debug(f"Function call arguments complete")
+                    call_id = event.call_id if hasattr(event, 'call_id') else None
+                    function_name = event.name if hasattr(event, 'name') else None
+                    arguments_str = event.arguments if hasattr(event, 'arguments') else '{}'
+                    
+                    if call_id and function_name:
+                        try:
+                            arguments = json.loads(arguments_str)
+                            # Handle function call in background
+                            asyncio.create_task(self._handle_function_call(call_id, function_name, arguments))
+                        except json.JSONDecodeError as e:
+                            logger.error(f"Failed to parse function arguments: {e}")
+                else:
+                    logger.debug(f"Unhandled message type: {msg_type}")
         except Exception as e:
             if not self._quit_event.is_set():
                 logger.exception("Error in message receiving loop")
@@ -539,30 +631,253 @@ class AzureOpenAIRealtimeClient:
                 self._quit_event.set()
 
 
+    async def _handle_function_call(self, call_id: str, function_name: str, arguments: dict):
+        """Handle function call from the model with round-robin async mock.
+        
+        Args:
+            call_id: The function call ID from the model
+            function_name: Name of the function to call
+            arguments: Function arguments as dict
+        """
+        try:
+            logger.info(f"Function call: {function_name} with args: {arguments}")
+            self._display_message("system_event", f"📞 Function call: {function_name}")
+            self._display_message("system_event", f"   Destination: {arguments.get('destination', 'N/A')}")
+            self._display_message("system_event", f"   Vacation Type: {arguments.get('vacation_type', 'N/A')}")
+            self._display_message("system_event", f"   Summary: {arguments.get('conversation_summary', 'N/A')}")
+            self._display_message("system_event", f"   Mood: {arguments.get('user_mood', 'N/A')}")
+            self._display_message("system_event", f"   Happiness: {arguments.get('happiness_score', 0):.2f}")
+            
+            if function_name == "get_destination_info":
+                # Increment attempt counter for round-robin
+                self._function_call_attempt_counter += 1
+                attempt_num = self._function_call_attempt_counter
+                is_odd_attempt = attempt_num % 2 == 1
+                
+                destination = arguments.get('destination', 'Unknown')
+                vacation_type = arguments.get('vacation_type', 'general vacation')
+                happiness = arguments.get('happiness_score', 0.0)
+                
+                if is_odd_attempt:
+                    # Odd attempts: complete quickly (4 seconds) with full result
+                    self._display_message("system_event", f"⏳ Attempt #{attempt_num} (ODD): Simulating quick API call (4s)...")
+                    await asyncio.sleep(4.0)
+                    
+                    # Generate full mock response
+                    result = {
+                        "destination": destination,
+                        "available_packages": 3,
+                        "price_range": "15,000 - 45,000 CZK",
+                        "best_season": "duben - září",
+                        "highlights": [
+                            "Luxusní hotely s all-inclusive",
+                            "Průvodce v češtině",
+                            "Speciální nabídky pro rodiny"
+                        ],
+                        "customer_sentiment": "positive" if happiness > 0 else "neutral" if happiness == 0 else "needs_attention"
+                    }
+                    
+                    # Send function result back to model
+                    await self._connection.conversation.item.create(
+                        item={
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": json.dumps(result, ensure_ascii=False)
+                        }
+                    )
+                    
+                    # Trigger response generation
+                    await self._connection.response.create()
+                    
+                    self._display_message("system_event", "✅ Function call completed synchronously")
+                    
+                else:
+                    # Even attempts: timeout after 5s, return pending status with job_id
+                    self._display_message("system_event", f"⏳ Attempt #{attempt_num} (EVEN): Simulating slow API (5s timeout)...")
+                    await asyncio.sleep(5.0)
+                    
+                    # Generate job ID
+                    job_id = str(uuid.uuid4())
+                    
+                    # Return pending status
+                    pending_result = {
+                        "status": "pending",
+                        "job_id": job_id,
+                        "message": "Your request has been acknowledged and is being processed in the background. This may take a moment."
+                    }
+                    
+                    # Send pending result back to model
+                    await self._connection.conversation.item.create(
+                        item={
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": json.dumps(pending_result, ensure_ascii=False)
+                        }
+                    )
+                    
+                    # Trigger response so model can acknowledge
+                    await self._connection.response.create()
+                    
+                    self._display_message("system_event", f"⏳ Function call returned PENDING status (job_id: {job_id})")
+                    self._display_message("system_event", f"📋 Starting background async job (will complete in {self._async_completion_delay}s)")
+                    
+                    # Start background task to simulate async completion
+                    asyncio.create_task(
+                        self._handle_async_job_completion(job_id, destination, vacation_type, happiness)
+                    )
+                
+            else:
+                logger.warning(f"Unknown function: {function_name}")
+                
+        except Exception as e:
+            logger.error(f"Error handling function call: {e}")
+            self._display_message("status_error", f"Function call error: {e}")
+    
+    async def _handle_async_job_completion(self, job_id: str, destination: str, vacation_type: str, happiness: float):
+        """Handle async job completion by polling and injecting result when ready.
+        
+        Args:
+            job_id: The job ID to track
+            destination: Destination name
+            vacation_type: Type of vacation
+            happiness: Happiness score
+        """
+        try:
+            # Simulate async work with configurable delay
+            elapsed = 0.0
+            poll_interval = 1.0  # Check every 1 second
+            
+            while elapsed < self._async_completion_delay:
+                await asyncio.sleep(poll_interval)
+                elapsed += poll_interval
+                logger.debug(f"Polling async job {job_id}: {elapsed:.1f}s / {self._async_completion_delay:.1f}s")
+                
+                # Check if we should quit
+                if self._quit_event.is_set():
+                    logger.info(f"Async job {job_id} cancelled due to quit")
+                    return
+            
+            # Job completed - generate final result
+            self._display_message("system_event", f"✅ Async job {job_id} completed! Injecting result...")
+            
+            # Cancel active response if one is in progress (to interrupt filler speech)
+            if self._response_active:
+                self._display_message("system_event", "⚡ Cancelling active response to deliver async result")
+                try:
+                    await self._connection.response.cancel()
+                    # Flush audio playback buffer to stop filler speech immediately
+                    self._flush_audio_playback_buffer()
+                    await asyncio.sleep(0.1)  # Brief pause for cancel to take effect
+                except Exception as e:
+                    logger.warning(f"Could not cancel active response: {e}")
+            
+            result = {
+                "destination": destination,
+                "available_packages": 3,
+                "price_range": "15,000 - 45,000 CZK",
+                "best_season": "duben - září",
+                "highlights": [
+                    "Luxusní hotely s all-inclusive",
+                    "Průvodce v češtině",
+                    "Speciální nabídky pro rodiny"
+                ],
+                "customer_sentiment": "positive" if happiness > 0 else "neutral" if happiness == 0 else "needs_attention"
+            }
+            
+            # Inject result as a new system message in conversation
+            await self._connection.conversation.item.create(
+                item={
+                    "type": "message",
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": f"ASYNC JOB COMPLETED: Job {job_id} has finished. The destination information is now available: {json.dumps(result, ensure_ascii=False)}"
+                        }
+                    ]
+                }
+            )
+            
+            # Trigger response generation so model can speak the result
+            await self._connection.response.create()
+            
+            self._display_message("system_event", f"📢 Triggered response for async result (job_id: {job_id})")
+            
+        except Exception as e:
+            logger.error(f"Error in async job completion handler: {e}")
+            self._display_message("status_error", f"Async job error: {e}")
+    
     def _construct_session_config(self) -> dict:
         """Construct session configuration based on YAML config.
         
         Returns:
-            dict: Session configuration for OpenAI Realtime API
+            dict: Session configuration for OpenAI Realtime API (official format)
         """
         session_config = {
-            "modalities": ["text", "audio"],
-            "instructions": "You are a helpful AI assistant. Respond naturally and conversationally.",
-            "voice": "alloy",
-            "input_audio_format": "pcm16",
-            "output_audio_format": "pcm16",
-            "input_audio_transcription": {
-                "model": "whisper-1"
-            },
-            "temperature": 0.8
+            "type": "realtime",
+            "instructions": self._system_prompt,
+            "output_modalities": ["audio"],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "get_destination_info",
+                    "description": "Retrieves vacation information, packages, hotels, and activities for a specific destination. IMPORTANT: Call this function EVERY TIME the customer mentions a new destination OR a new type of vacation for any destination (e.g., if they first ask about Paris for sightseeing, then about Paris for romantic getaway - call again). Always call when destination or vacation type changes.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "destination": {
+                                "type": "string",
+                                "description": "The destination name (e.g., 'Paris', 'Bali', 'Tokyo', 'Prague')"
+                            },
+                            "vacation_type": {
+                                "type": "string",
+                                "description": "Type of vacation the customer is interested in (e.g., 'beach vacation', 'city sightseeing', 'romantic getaway', 'family trip', 'adventure travel', 'wellness retreat', 'cultural tour')"
+                            },
+                            "conversation_summary": {
+                                "type": "string",
+                                "description": "Brief summary of what the customer has shared so far and what they want. Include: their preferences, constraints (budget, dates, family size), any concerns mentioned, and their main goal for this vacation. Example: 'Customer wants beach vacation for family of 4, budget around 30k CZK, prefers all-inclusive, worried about kids activities'"
+                            },
+                            "user_mood": {
+                                "type": "string",
+                                "description": "Describe the customer's emotional state and attitude in your own words based on the conversation. Examples: 'excited and enthusiastic', 'neutral and inquiring', 'frustrated with previous options', 'disappointed but hopeful', 'very happy and eager', 'slightly annoyed', 'calm and considerate'. Be specific and natural."
+                            },
+                            "happiness_score": {
+                                "type": "number",
+                                "description": "Customer's emotional state as a numeric score. Range: -1.0 (extremely angry/frustrated) to 1.0 (extremely happy/excited). 0.0 is neutral. This is a simplified metric - use user_mood for detailed description.",
+                                "minimum": -1.0,
+                                "maximum": 1.0
+                            }
+                        },
+                        "required": ["destination", "vacation_type", "conversation_summary", "user_mood", "happiness_score"]
+                    }
+                }
+            ],
+            "audio": {
+                "input": {
+                    "transcription": {
+                        "model": "whisper-1"
+                    },
+                    "format": {
+                        "type": "audio/pcm",
+                        "rate": 24000
+                    }
+                },
+                "output": {
+                    "voice": "alloy",
+                    "format": {
+                        "type": "audio/pcm",
+                        "rate": 24000
+                    }
+                }
+            }
         }
         
-        # Configure turn detection based on YAML config
+        # Configure turn detection based on YAML config in official format
         turn_detection_config = self.yaml_config.get('turn_detection', {})
         
         if turn_detection_config.get('type') is None:
             # Push-to-talk mode - no automatic turn detection
-            session_config["turn_detection"] = None
+            session_config["audio"]["input"]["turn_detection"] = None
             logger.debug("Configured for push-to-talk mode (no automatic turn detection)")
             
         elif turn_detection_config.get('type') == 'server_vad':
@@ -580,10 +895,8 @@ class AzureOpenAIRealtimeClient:
                 vad_config["silence_duration_ms"] = turn_detection_config['silence_duration_ms']
             if 'create_response' in turn_detection_config:
                 vad_config["create_response"] = turn_detection_config['create_response']
-            if 'interrupt_response' in turn_detection_config:
-                vad_config["interrupt_response"] = turn_detection_config['interrupt_response']
                 
-            session_config["turn_detection"] = vad_config
+            session_config["audio"]["input"]["turn_detection"] = vad_config
             logger.debug(f"Configured for server VAD mode: {vad_config}")
             
         elif turn_detection_config.get('type') == 'semantic_vad':
@@ -595,10 +908,8 @@ class AzureOpenAIRealtimeClient:
             # Add optional semantic VAD parameters if specified
             if 'create_response' in turn_detection_config:
                 vad_config["create_response"] = turn_detection_config['create_response']
-            if 'interrupt_response' in turn_detection_config:
-                vad_config["interrupt_response"] = turn_detection_config['interrupt_response']
                 
-            session_config["turn_detection"] = vad_config
+            session_config["audio"]["input"]["turn_detection"] = vad_config
             logger.debug(f"Configured for semantic VAD mode: {vad_config}")
         
         return session_config
@@ -616,56 +927,57 @@ class AzureOpenAIRealtimeClient:
             )
             self._display_message("mic_ready", f"Microphone stream opened (24kHz, 16-bit, mono).")
 
-            headers = await self._get_auth_headers()
-            self._display_message("status_connect", f"Connecting to {self._websocket_url}...")
+            # Get auth token for OpenAI client
+            token = await self._get_auth_token()
+            self._display_message("status_connect", f"Connecting to Azure OpenAI...")
             
-            async with aiohttp.ClientSession(headers=headers) as session:
-                async with session.ws_connect(self._websocket_url) as ws_connection:
-                    self._ws = ws_connection
-                    self._display_message("status_ok", "Successfully connected to Azure OpenAI.")
-                    
-                    # Configure session with YAML-based configuration
-                    session_data = self._construct_session_config()
-                    session_config = {
-                        "type": "session.update",
-                        "session": session_data
-                    }
-                    logger.debug(f"Sending session update: {json.dumps(session_config, indent=2)}")
-                    
-                    await self._ws.send_json(session_config)
-                    self._display_message("status_info", f"Sent session configuration ({self.yaml_config['scenario']}).")
+            # Create OpenAI client with Azure configuration
+            client = AsyncOpenAI(
+                websocket_base_url=self._base_url,
+                api_key=token
+            )
+            
+            # Connect using OpenAI SDK's realtime connection
+            async with client.realtime.connect(model=self._deployment_name) as connection:
+                self._connection = connection
+                self._display_message("status_ok", "Successfully connected to Azure OpenAI.")
+                
+                # Configure session with YAML-based configuration
+                session_data = self._construct_session_config()
+                logger.debug(f"Sending session update: {json.dumps(session_data, indent=2)}")
+                
+                await connection.session.update(session=session_data)
+                self._display_message("status_info", f"Sent session configuration ({self.yaml_config.get('scenario', 'default')}).")
 
-                    # Display appropriate instructions based on VAD mode
-                    if self._is_push_to_talk:
-                        self._display_message("user_action", "Press SPACEBAR to talk, 'q' to quit.")
+                # Display appropriate instructions based on VAD mode
+                if self._is_push_to_talk:
+                    self._display_message("user_action", "Press SPACEBAR to talk, 'q' to quit.")
+                else:
+                    if self._vad_mode == 'server_vad':
+                        self._display_message("user_action", "Speak naturally (Server VAD enabled). Press SPACEBAR to manually trigger response, 'q' to quit.")
+                    elif self._vad_mode == 'semantic_vad':
+                        self._display_message("user_action", "Speak naturally (Semantic VAD enabled). Press SPACEBAR to manually trigger response, 'q' to quit.")
                     else:
-                        if self._vad_mode == 'server_vad':
-                            self._display_message("user_action", "Speak naturally (Server VAD enabled). Press SPACEBAR to manually trigger response, 'q' to quit.")
-                        elif self._vad_mode == 'semantic_vad':
-                            self._display_message("user_action", "Speak naturally (Semantic VAD enabled). Press SPACEBAR to manually trigger response, 'q' to quit.")
-                        else:
-                            self._display_message("user_action", "Speak naturally (VAD enabled), 'q' to quit.")
+                        self._display_message("user_action", "Speak naturally (VAD enabled), 'q' to quit.")
 
-                    loop = asyncio.get_event_loop()
-                    self._keyboard_listener = keyboard.Listener(
-                        on_press=lambda k: loop.call_soon_threadsafe(self._on_keyboard_press, k),
-                        on_release=lambda k: loop.call_soon_threadsafe(self._on_keyboard_release, k)
-                    )
-                    self._keyboard_listener.start()
-                    self._display_message("system_event", "Keyboard listener started.")
+                loop = asyncio.get_event_loop()
+                self._keyboard_listener = keyboard.Listener(
+                    on_press=lambda k: loop.call_soon_threadsafe(self._on_keyboard_press, k),
+                    on_release=lambda k: loop.call_soon_threadsafe(self._on_keyboard_release, k)
+                )
+                self._keyboard_listener.start()
+                self._display_message("system_event", "Keyboard listener started.")
 
-                    self._tasks = [
-                        asyncio.create_task(self._audio_capture_loop()),
-                        asyncio.create_task(self._stream_audio_loop()),
-                        asyncio.create_task(self._handle_recording_completion()),
-                        asyncio.create_task(self._receive_server_messages_loop())
-                    ]
-                    
-                    logger.debug("All async tasks started, waiting for quit event")
-                    await self._quit_event.wait() # Keep running until quit is signaled
+                self._tasks = [
+                    asyncio.create_task(self._audio_capture_loop()),
+                    asyncio.create_task(self._stream_audio_loop()),
+                    asyncio.create_task(self._handle_recording_completion()),
+                    asyncio.create_task(self._receive_server_messages_loop())
+                ]
+                
+                logger.debug("All async tasks started, waiting for quit event")
+                await self._quit_event.wait()  # Keep running until quit is signaled
 
-        except aiohttp.ClientConnectorError as e:
-            self._display_message("status_error", f"Connection failed: {e}")
         except Exception as e:
             if "pyaudio" in str(e).lower():
                 self._display_message("status_error", f"PyAudio error: {e}. Check microphone/PortAudio.")
@@ -699,10 +1011,10 @@ class AzureOpenAIRealtimeClient:
                 await asyncio.gather(*self._tasks, return_exceptions=True)
             self._display_message("system_event", "All async tasks processed.")
 
-            # Close WebSocket
-            if self._ws and not self._ws.closed:
-                await self._ws.close()
-                self._display_message("status_info", "WebSocket connection closed.")
+            # Connection is closed automatically by context manager
+            if self._connection:
+                self._display_message("status_info", "Connection closed.")
+                self._connection = None
 
             # Clean up PyAudio
             if self._pyaudio_stream:
@@ -713,19 +1025,54 @@ class AzureOpenAIRealtimeClient:
                 self._pyaudio_instance.terminate()
                 self._display_message("system_event", "PyAudio terminated.")
             
-            # Clean up pygame mixer
-            try:
-                pygame.mixer.quit()
-                self._display_message("system_event", "Pygame mixer stopped.")
-            except Exception as e:
-                logger.debug(f"Error stopping pygame mixer: {e}")
-            
             # Close Azure credential
             if self._credential:
-                await self._credential.close()
+                self._credential.close()
                 self._display_message("system_event", "Azure credential closed.")
             
             self._display_message("quit", "Voice Chat Client shut down gracefully.")
+
+    def _handle_user_interruption(self):
+        """Handle user interruption (speaking, key press, etc.) by flushing audio and notifying server."""
+        logger.debug("Handling user interruption")
+        
+        # Immediately flush audio buffer
+        self._flush_audio_playback_buffer()
+        
+        # Send cancel request to server if connection is open
+        if self._connection:
+            try:
+                loop = asyncio.get_event_loop()
+                loop.create_task(self._send_response_cancel())
+            except Exception as e:
+                logger.error(f"Error scheduling response cancel: {e}")
+
+    async def _send_response_cancel(self):
+        """Send response.cancel event to stop ongoing AI response."""
+        try:
+            await self._connection.response.cancel()
+            logger.debug("Sent response.cancel to server")
+        except Exception as e:
+            logger.error(f"Error sending response.cancel: {e}")
+
+    def _detect_bluetooth_audio(self):
+        """Detect if we're likely using Bluetooth audio and adjust settings accordingly."""
+        try:
+            import subprocess
+            # Check for Bluetooth audio devices on Windows
+            result = subprocess.run(['powershell', '-Command', 
+                                   'Get-WmiObject -Class Win32_PnPEntity | Where-Object {$_.Name -like "*Bluetooth*" -and $_.Name -like "*Audio*"}'],
+                                   capture_output=True, text=True, timeout=5)
+            
+            if result.returncode == 0 and result.stdout.strip():
+                self._display_message("status_info", "🔵 Bluetooth audio device detected - using optimized settings")
+                self._bluetooth_delay = 0.02  # Minimal delay with very large chunks
+                self._min_chunk_size = 144000  # Very large chunks for Bluetooth (~3000ms = 3 seconds)
+                return True
+        except Exception as e:
+            logger.debug(f"Could not detect Bluetooth audio: {e}")
+        
+        return False
 
 async def main():
     """Main application function with command line argument support."""
@@ -786,7 +1133,6 @@ Available configurations:
     app_config = {
         "AZURE_OPENAI_ENDPOINT": os.environ.get("AZURE_OPENAI_ENDPOINT"),
         "AZURE_OPENAI_DEPLOYMENT_NAME": os.environ.get("AZURE_OPENAI_DEPLOYMENT_NAME"),
-        "OPENAI_API_VERSION": os.environ.get("OPENAI_API_VERSION"),
     }
     
     # Validate required environment variables

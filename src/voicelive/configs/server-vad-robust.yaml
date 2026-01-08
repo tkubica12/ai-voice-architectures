@@ -1,0 +1,38 @@
+# Server VAD Robust Configuration
+# Low sensitivity server VAD for noisy environments
+# Better at filtering out background noise
+
+scenario: "voicelive-server-vad-robust"
+description: "Low sensitivity server VAD for noisy environments"
+
+# Model configuration
+model: "gpt-4o"
+
+# Voice configuration
+voice:
+  name: "en-US-Ava:DragonHDLatestNeural"
+  type: "azure-standard"
+  temperature: 0.8
+  locale: "cs-CZ"  # Force Czech locale for Czech language output
+
+# Turn Detection Configuration - Less sensitive settings
+turn_detection:
+  type: "server_vad"
+  threshold: 0.7  # Higher threshold = less sensitive, ignores quiet sounds
+  prefix_padding_ms: 200  # Less audio before speech
+  silence_duration_ms: 700  # Longer silence required to end speech
+
+# Audio processing configuration
+audio:
+  echo_cancellation: true
+  noise_reduction: true
+  noise_reduction_type: "azure_deep_noise_suppression"
+
+# Input audio transcription configuration
+transcription:
+  enabled: true
+  model: "azure-speech"  # Use azure-speech for non-realtime models
+  language: "cs"
+
+# Proactive greeting
+proactive_greeting: true

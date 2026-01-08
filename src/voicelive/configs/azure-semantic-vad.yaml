@@ -1,0 +1,46 @@
+# Azure Semantic VAD Configuration
+# This mode uses Azure's semantic voice activity detection
+# Advanced AI-powered detection of speech completion based on context
+
+scenario: "voicelive-azure-semantic-vad"
+description: "Azure semantic VAD with end-of-utterance detection for natural conversations"
+
+# Model configuration
+model: "gpt-4o"
+
+# Voice configuration
+voice:
+  name: "en-US-Ava:DragonHDLatestNeural"
+  type: "azure-standard"
+  temperature: 0.8
+  locale: "cs-CZ"  # Force Czech locale for Czech language output
+
+# Turn Detection Configuration - Azure Semantic VAD
+turn_detection:
+  type: "azure_semantic_vad"
+  threshold: 0.3  # Lower threshold for more sensitive detection
+  prefix_padding_ms: 200  # Audio to include before detected speech
+  silence_duration_ms: 200  # Shorter silence detection for responsiveness
+  remove_filler_words: false  # Remove filler words like "um", "uh"
+  interrupt_response: true  # Allow user to interrupt AI
+  
+  # End of utterance detection - advanced feature
+  end_of_utterance_detection:
+    model: "semantic_detection_v1"
+    threshold_level: "default"  # low, medium, high, default
+    timeout_ms: 1000
+
+# Audio processing configuration
+audio:
+  echo_cancellation: true
+  noise_reduction: true
+  noise_reduction_type: "azure_deep_noise_suppression"
+
+# Input audio transcription configuration
+transcription:
+  enabled: true
+  model: "azure-speech"  # Use azure-speech for non-realtime models
+  language: "cs"
+
+# Proactive greeting - whether AI speaks first
+proactive_greeting: true
